@@ -21,6 +21,10 @@ std::string connection_status = "Not connected";
 std::string host_ip = "192.168.1.2";  // Placeholder IP for host
 std::mutex connection_status_mutex;   // Mutex for thread safety
 
+// Number of reconnection attempts and delay between retries (in seconds)
+const int MAX_RETRIES = 5;
+const int RETRY_DELAY = 3;  // Retry delay in seconds
+
 // Initialize OpenSSL
 void init_openssl() {
     OpenSSL_add_all_algorithms();
@@ -148,36 +152,73 @@ void async_send_data(std::shared_ptr<SSL> ssl) {
     });
 }
 
-// Client function (connect to host)
+// Add delay for retries
+void attempt_reconnect(int& attempts, bool& connected) {
+    std::this_thread::sleep_for(std::chrono::seconds(RETRY_DELAY));  // Wait before retrying
+    attempts++;
+    if (attempts < MAX_RETRIES) {
+        {  // Lock for thread-safe status update
+            lock_guard<mutex> lock(connection_status_mutex);
+            connection_status = "Retrying connection... Attempt " + std::to_string(attempts + 1) + "/" + std::to_string(MAX_RETRIES);
+        }
+        DeckyUpdateMenu();
+    }
+}
+
+// Modified client function with reconnection attempts
 void start_client(const std::string& host_ip) {
-    try {
-        tcp::resolver resolver(io_service);
-        tcp::resolver::query query(host_ip, "12345");
-        tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+    int attempts = 0;
+    bool connected = false;
 
-        boost::asio::async_connect(socket, endpoint_iterator, [this](boost::system::error_code ec, tcp::resolver::iterator) {
-            if (!ec) {
-                auto ssl = create_ssl_client();
-                if (!ssl) {
-                    cerr << "SSL handshake failed in client" << endl;
-                    return;
-                }
-                {  // Lock for thread-safe status update
-                    lock_guard<mutex> lock(connection_status_mutex);
-                    connection_status = "Connected to server securely!";
-                }
-                DeckyUpdateMenu();
-                async_send_data(ssl);  // Start sending data asynchronously
-            } else {
-                cerr << "Error connecting to server: " << ec.message() << endl;
-            }
-        });
+    while (attempts < MAX_RETRIES && !connected) {
+        try {
+            tcp::resolver resolver(io_service);
+            tcp::resolver::query query(host_ip, "12345");
+            tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
 
-        io_service.run();  // Start the io_service to process async operations
-    } catch (const std::exception& e) {
-        cerr << "Exception in client: " << e.what() << endl;
-    } catch (...) {
-        cerr << "Unknown error in client" << endl;
+            boost::asio::async_connect(socket, endpoint_iterator, [&connected, this](boost::system::error_code ec, tcp::resolver::iterator) {
+                if (!ec) {
+                    auto ssl = create_ssl_client();
+                    if (!ssl) {
+                        cerr << "SSL handshake failed in client" << endl;
+                        return;
+                    }
+                    {  // Lock for thread-safe status update
+                        lock_guard<mutex> lock(connection_status_mutex);
+                        connection_status = "Connected to server securely!";
+                    }
+                    DeckyUpdateMenu();
+                    async_send_data(ssl);  // Start sending data asynchronously
+                    connected = true;  // Connection established successfully
+                } else {
+                    cerr << "Error connecting to server: " << ec.message() << endl;
+                    connected = false;
+                }
+            });
+
+            io_service.run();  // Start the io_service to process async operations
+
+        } catch (const std::exception& e) {
+            cerr << "Exception in client: " << e.what() << endl;
+            connected = false;
+        } catch (...) {
+            cerr << "Unknown error in client" << endl;
+            connected = false;
+        }
+
+        if (!connected) {
+            // If connection failed, attempt to reconnect
+            attempt_reconnect(attempts, connected);
+        }
+    }
+
+    if (!connected) {
+        {  // Lock for thread-safe status update
+            lock_guard<mutex> lock(connection_status_mutex);
+            connection_status = "Failed to connect after " + std::to_string(MAX_RETRIES) + " attempts.";
+        }
+        DeckyUpdateMenu();
+        cout << "Failed to connect after " << MAX_RETRIES << " attempts." << endl;
     }
 }
 
@@ -218,7 +259,7 @@ void create_ui() {
 
         // Start the client in a separate thread and wait for it to finish
         std::thread client_thread([]() {
-            start_client(host_ip);
+            start_client(host_ip);  // This now handles retries
         });
         client_thread.join();  // Wait for the client to finish before returning
     });
