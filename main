@@ -1,0 +1,223 @@
+#include <decky_plugin_sdk/decky_plugin.h>
+#include <boost/asio.hpp>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <iostream>
+#include <thread>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <memory>  // For std::shared_ptr
+
+using boost::asio::ip::tcp;
+using namespace std;
+
+// OpenSSL setup
+SSL_CTX* ssl_ctx = nullptr;
+boost::asio::io_service io_service;
+tcp::socket socket(io_service);
+std::string game_mode = "client";
+std::string connection_status = "Not connected";
+std::string host_ip = "192.168.1.2";  // Placeholder IP for host
+std::mutex connection_status_mutex;   // Mutex for thread safety
+
+// Initialize OpenSSL
+void init_openssl() {
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    ssl_ctx = SSL_CTX_new(TLS_server_method());  // Use TLS instead of SSL
+    if (!ssl_ctx) {
+        cerr << "Error creating SSL context" << endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure certificate and private key (example, replace with actual files)
+    if (SSL_CTX_use_certificate_file(ssl_ctx, "server_cert.pem", SSL_FILETYPE_PEM) <= 0) {
+        cerr << "Error loading server certificate" << endl;
+        exit(EXIT_FAILURE);
+    }
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "server_key.pem", SSL_FILETYPE_PEM) <= 0) {
+        cerr << "Error loading server private key" << endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify the private key matches the certificate
+    if (!SSL_CTX_check_private_key(ssl_ctx)) {
+        cerr << "Private key does not match the certificate public key" << endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Clean up OpenSSL
+void cleanup_openssl() {
+    SSL_CTX_free(ssl_ctx);
+}
+
+// SSL server setup
+std::shared_ptr<SSL> create_ssl_server(tcp::socket& client_socket) {
+    std::shared_ptr<SSL> ssl(SSL_new(ssl_ctx), SSL_free);  // Use shared_ptr for automatic cleanup
+    if (!ssl) {
+        cerr << "Error creating SSL object in server" << endl;
+        return nullptr;
+    }
+    SSL_set_fd(ssl.get(), client_socket.native_handle());
+    if (SSL_accept(ssl.get()) <= 0) {
+        cerr << "Error accepting SSL connection in server: " << SSL_get_error(ssl.get(), 0) << endl;
+        return nullptr;
+    }
+    return ssl;
+}
+
+// SSL client setup
+std::shared_ptr<SSL> create_ssl_client() {
+    std::shared_ptr<SSL> ssl(SSL_new(ssl_ctx), SSL_free);  // Use shared_ptr for automatic cleanup
+    if (!ssl) {
+        cerr << "Error creating SSL object in client" << endl;
+        return nullptr;
+    }
+    SSL_set_fd(ssl.get(), socket.native_handle());
+    if (SSL_connect(ssl.get()) <= 0) {
+        cerr << "Error connecting SSL in client: " << SSL_get_error(ssl.get(), 0) << endl;
+        return nullptr;
+    }
+    return ssl;
+}
+
+// Asynchronous data reading in the server
+void async_read_data(std::shared_ptr<SSL> ssl) {
+    char buffer[128];
+    ssl->async_read_some(boost::asio::buffer(buffer),
+        [ssl, buffer](boost::system::error_code ec, std::size_t bytes_received) {
+            if (!ec && bytes_received > 0) {
+                std::string data(buffer, bytes_received);
+                cout << "Received: " << data << endl;
+                async_read_data(ssl);  // Keep reading as long as the connection is alive
+            } else if (ec) {
+                cerr << "SSL read error: " << ec.message() << endl;
+            }
+        });
+}
+
+// Server function (host)
+void start_server() {
+    try {
+        tcp::acceptor acceptor(io_service, tcp::endpoint(tcp::v4(), 12345));
+        tcp::socket client_socket(io_service);
+        acceptor.async_accept(client_socket,
+            [&client_socket](boost::system::error_code ec) {
+                if (!ec) {
+                    auto ssl = create_ssl_server(client_socket);
+                    if (!ssl) {
+                        cerr << "SSL handshake failed in server" << endl;
+                        return;
+                    }
+                    {
+                        lock_guard<mutex> lock(connection_status_mutex);
+                        connection_status = "Client connected securely!";
+                    }
+                    DeckyUpdateMenu();
+                    async_read_data(ssl);  // Start reading data asynchronously
+                } else {
+                    cerr << "Error accepting connection: " << ec.message() << endl;
+                }
+            });
+        io_service.run();  // Start the io_service to process async operations
+    } catch (const std::exception& e) {
+        cerr << "Exception in server: " << e.what() << endl;
+    } catch (...) {
+        cerr << "Unknown error in server" << endl;
+    }
+}
+
+// Asynchronous data sending in the client
+void async_send_data(std::shared_ptr<SSL> ssl) {
+    std::string message = "Player Data: X=10, Y=20";
+    boost::asio::async_write(*ssl, boost::asio::buffer(message),
+        [ssl](boost::system::error_code ec, std::size_t bytes_sent) {
+            if (ec) {
+                cerr << "Error sending data: " << ec.message() << endl;
+            }
+        });
+}
+
+// Client function (connect to host)
+void start_client(const std::string& host_ip) {
+    try {
+        tcp::resolver resolver(io_service);
+        tcp::resolver::query query(host_ip, "12345");
+        tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+        boost::asio::async_connect(socket, endpoint_iterator,
+            [this](boost::system::error_code ec, tcp::resolver::iterator) {
+                if (!ec) {
+                    auto ssl = create_ssl_client();
+                    if (!ssl) {
+                        cerr << "SSL handshake failed in client" << endl;
+                        return;
+                    }
+                    {
+                        lock_guard<mutex> lock(connection_status_mutex);
+                        connection_status = "Connected to server securely!";
+                    }
+                    DeckyUpdateMenu();
+                    async_send_data(ssl);  // Start sending data asynchronously
+                } else {
+                    cerr << "Error connecting to server: " << ec.message() << endl;
+                }
+            });
+        io_service.run();  // Start the io_service to process async operations
+    } catch (const std::exception& e) {
+        cerr << "Exception in client: " << e.what() << endl;
+    } catch (...) {
+        cerr << "Unknown error in client" << endl;
+    }
+}
+
+// UI creation
+void create_ui() {
+    DeckyCreateMenuItem("Game Mode", "Choose your game mode", false);
+    DeckyCreateSubMenu("game_mode_submenu");
+
+    // Add a text input for the host IP
+    DeckyCreateMenuItem("Host IP", "Enter the server IP", false);
+    DeckyCreateInputField("host_ip_input", host_ip.c_str(), 15, false, [](const char* new_ip) {
+        host_ip = new_ip;
+        cout << "Updated host IP: " << host_ip << endl;
+    });
+
+    DeckyAddMenuItemToSubMenu("game_mode_submenu", "Host", []() {
+        game_mode = "host";
+        {
+            lock_guard<mutex> lock(connection_status_mutex);
+            connection_status = "Waiting for client connection...";
+        }
+        DeckyUpdateMenu();
+        std::thread server_thread([]() { start_server(); });
+        server_thread.detach();  // Detach so it runs in the background
+    });
+    DeckyAddMenuItemToSubMenu("game_mode_submenu", "Client", []() {
+        game_mode = "client";
+        {
+            lock_guard<mutex> lock(connection_status_mutex);
+            connection_status = "Searching for server...";
+        }
+        DeckyUpdateMenu();
+        std::thread client_thread([]() { start_client(host_ip); });
+        client_thread.detach();  // Detach so it runs in the background
+    });
+    DeckyAddSubMenuToMenu("Game Mode", "game_mode_submenu");
+    DeckyCreateLabel("Connection Status", connection_status.c_str());
+    DeckyUpdateMenu();
+}
+
+// Plugin entry point
+extern "C" void DeckyPluginInit(DeckyPluginContext* context) {
+    // Initialize OpenSSL
+    init_openssl();
+    // Create the UI
+    create_ui();
+}
+
+// Cleanup function when the plugin is unloaded
+extern "C" void DeckyPluginDeinit() {
+    cleanup_openssl();
+}
